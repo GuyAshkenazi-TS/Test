@@ -7,7 +7,7 @@ Outputs:
 Also prints ready-to-copy commands for Stage 2 per subscription.
 """
 
-import os, subprocess, json, csv
+import os, subprocess, json, csv, sys
 from datetime import datetime
 
 os.environ.setdefault("AZURE_CORE_NO_COLOR", "1")
@@ -39,7 +39,7 @@ def az_json(cmd, default):
         return default
 
 def ensure_login():
-    az(["az","account","show","--only-show-errors"])
+    az(["az", "account", "show", "--only-show-errors"])
 
 def offer_from_quota(quota_id: str, authorization_source: str, has_mca_billing_link: bool) -> str:
     q = quota_id or ""
@@ -95,13 +95,23 @@ def resolve_owner(sub_id: str, offer: str) -> str:
 def transferable_to_ea(offer: str) -> str:
     return "Yes" if offer in ("EA","Pay-As-You-Go") else "No"
 
+def banner(text: str):
+    line = "─" * len(text)
+    print(f"\n{text}\n{line}")
+
 def main():
     ensure_login()
     subs = az_json(["az","account","list","--all","-o","json"], [])
+    if not subs:
+        print("No subscriptions found (or insufficient permissions).")
+        sys.exit(0)
+
     billing_accounts = az_json(["az","billing","account","list","-o","json"], [])
     overall_agreement = ""
-    try: overall_agreement = (billing_accounts[0].get("agreementType") or "")
-    except Exception: pass
+    try:
+        overall_agreement = (billing_accounts[0].get("agreementType") or "")
+    except Exception:
+        pass
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_discovery = f"subscriptions_discovery_{ts}.csv"
@@ -123,20 +133,24 @@ def main():
         transferable = transferable_to_ea(offer)
         rows.append([sub_id, offer, owner, transferable])
 
+    # Write CSV
     with open(out_discovery,"w",newline="",encoding="utf-8") as f:
         w=csv.writer(f); w.writerow(headers); w.writerows(rows)
 
-    print(f"✅ Subscriptions CSV: {out_discovery}\n")
-    print("Run Stage-2 per subscription (copy-paste the command below):\n")
+    # Output
+    print(f"✅ Subscriptions CSV: {out_discovery}")
+
+    banner("Run Stage-2 per subscription (copy & paste)")
     for sub_id, *_ in rows:
         cmd = (
             f'python3 <(curl -s "{STAGE2_RAW}") '
             f'--subscription "{sub_id}" '
-            f'--move-support-url "{MOVE_SUPPORT_URL}" '
-            f'--include-arm-blockers 0 --run-arm-validate 0'
+            f'--move-support-url "{MOVE_SUPPORT_URL}"'
         )
         print(cmd)
-    print("\nTip: אפשר להריץ במקביל טרמינלים שונים לכל מנוי גדול.")
+
+    banner("Tip")
+    print("You can run Stage-2 for multiple large subscriptions in parallel terminals.")
 
 if __name__ == "__main__":
     main()
