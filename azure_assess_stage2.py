@@ -5,19 +5,20 @@ Stage 2: Per-subscription resource scan (read-only, fast & scalable)
 Outputs (file names כוללים את ה-Subscription לקלות):
   1) azure_env_discovery_<SUB>_<ts>.csv
   2) non_transferable_reasons_<SUB>_<ts>.csv
-  3) blockers_details_<SUB>_<ts>.csv          -> רק No + Not in table (ואופציונלי ARM)
-  4) resources_support_matrix_<SUB>_<ts>.csv  -> כל הריסורסים עם Yes/No/Not in table
+  3) blockers_details_<SUB>_<ts>.csv          -> רק No + Not in table (+ ARM אם הופעל)
+  4) resources_support_matrix_<SUB>_<ts>.csv  -> כל הריסורסים עם Yes / No / Not in table
 """
 
-import os, subprocess, json, csv, io, re, urllib.request, logging, time, argparse
-from datetime import datetime, timedelta
+import os, subprocess, json, csv, io, re, urllib.request, logging, time, argparse, math
+from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 
+# ---------- env ----------
 os.environ.setdefault("AZURE_CORE_NO_COLOR", "1")
 os.environ.setdefault("AZURE_EXTENSION_USE_DYNAMIC_INSTALL", "yes_without_prompt")
-
 MISSING = "Not available"
 
+# ---------- shell helpers ----------
 def az(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
     return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
@@ -36,12 +37,10 @@ def ensure_login():
 TYPE_ALIASES = {}
 def normalize_type(s: str) -> str:
     if not s: return ""
-    import re
     t = s.strip().lower()
     t = re.sub(r"\s+", "", t)
     t = re.sub(r"/+", "/", t)
-    t = TYPE_ALIASES.get(t, t)
-    return t
+    return TYPE_ALIASES.get(t, t)
 
 def _pick_col(row, *candidates):
     if not row: return None
@@ -52,6 +51,7 @@ def _pick_col(row, *candidates):
     return None
 
 # ---------- support table ----------
+# מחזיר: { 'microsoft.x/type[/child]' : (True/False/None, note) }
 def load_move_support_map_from_url(url: str) -> Dict[str, Tuple[Optional[bool], str]]:
     with urllib.request.urlopen(url) as resp:
         raw = resp.read()
@@ -147,12 +147,16 @@ def list_rgs(sub_id: str) -> List[str]:
 def list_resources_by_rg(subscription_id: str) -> Dict[str,List[str]]:
     resources = az_json(["az","resource","list","--subscription",subscription_id,
                          "--query","[].{id:id, type:type, rg:resourceGroup}","-o","json"], [])
-    non_movable = {"Microsoft.Network/networkWatchers","Microsoft.OffAzure/VMwareSites",
-                   "Microsoft.OffAzure/MasterSites","Microsoft.Migrate/migrateprojects",
-                   "Microsoft.Migrate/assessmentProjects"}
+    non_movable = {
+        "Microsoft.Network/networkWatchers",
+        "Microsoft.OffAzure/VMwareSites",
+        "Microsoft.OffAzure/MasterSites",
+        "Microsoft.Migrate/migrateprojects",
+        "Microsoft.Migrate/assessmentProjects",
+    }
     grouped={}
     for r in resources:
-        if r.get("type") in non_movable: 
+        if r.get("type") in non_movable:
             continue
         rg=r.get("rg"); rid=r.get("id")
         if rg and rid: grouped.setdefault(rg, []).append(rid)
@@ -163,7 +167,7 @@ def validate_move_resources(source_sub: str, rg: str, resource_ids: List[str], t
     body = json.dumps({"resources": resource_ids, "targetResourceGroup": target_rg_id})
     code, out, err = az(["az","resource","invoke-action","--action","validateMoveResources",
                          "--ids", f"/subscriptions/{source_sub}/resourceGroups/{rg}",
-                         "--request-body", body],)
+                         "--request-body", body])
     if code==0 and out:
         try: return json.loads(out)
         except Exception: return {}
@@ -185,7 +189,7 @@ def arm_error_to_tuple(err: Dict[str,Any]) -> Tuple[str,str,str]:
         return ("InsufficientPermissions","Caller lacks required permissions.","Ensure moveResources on source + write on target")
     if "cannot be moved" in blob or "not supported for move" in blob:
         return ("UnsupportedResourceType","Type/SKU not supported for move.","move-support")
-    return ("ValidationFailed", _shorten(err.get("message") or err.get("code") or ""), "ARM validateMoveResources")
+    return ("ValidationFailed", _shorten(err.get("message") or err.get("code") or "ARM validation failed"), "ARM validateMoveResources")
 
 # ---------- parse/classify ----------
 def parse_types(resource_id: str):
@@ -261,10 +265,11 @@ def main():
     bsub = az_json(["az","billing","subscription","show","--subscription-id",sub_id,"-o","json"], {})
     offer = offer_from_quota(quota_id, auth_src, bool(bsub.get("billingAccountId")))
     owner = resolve_owner(sub_id, offer)
-    transferable = "Yes" if offer in ("EA","Pay-As-You-Go") else "No"
+    transferable = transferable_to_ea(offer)
 
     with open(out_discovery,"w",newline="",encoding="utf-8") as f:
         w=csv.writer(f); w.writerow(headers_discovery); w.writerow([sub_id, offer, owner, transferable])
+
     reasons=[]
     if transferable=="No":
         if auth_src=="ByPartner":
@@ -282,7 +287,6 @@ def main():
     print(f"✅ Reasons   CSV: {out_reasons}")
 
     # Pre-scan inventory
-    rgs = list_rgs(sub_id)
     grouped = list_resources_by_rg(sub_id)
     rg_count = len(grouped)
     res_count = sum(len(v) for v in grouped.values())
@@ -292,11 +296,132 @@ def main():
             csv.writer(f).writerow(headers_blockers)
         with open(out_allres,"w",newline="",encoding="utf-8") as f:
             csv.writer(f).writerow(headers_allres)
-        print("No resources found.")
+        logging.info("No resources found. Exiting.")
+        # Summary
+        elapsed = time.perf_counter() - t0
+        logging.info(f"Summary: completed in {elapsed:.1f}s")
+        print(f"📄 Files:\n - {out_discovery}\n - {out_reasons}\n - {out_blockers}\n - {out_allres}")
         return
 
-    # Optional ARM validate (RG-level)
-    arm_rg_errors = {}
-    arm_rg_msg = {}
+    # בניית רשימה שטוחה לצורך לוג התקדמות
+    flat: List[Tuple[str,str]] = []
+    for rg, ids in grouped.items():
+        for rid in ids:
+            flat.append((rg, rid))
+
+    # Optional ARM validate (RG-level)—נריץ פעם אחת לכל RG מול RG יעד קיים באותו מנוי
+    arm_rg_errors: Dict[str, Dict[str,Any]] = {}
+    arm_rg_msg: Dict[str, str] = {}
     if RUN_ARM_VALIDATE:
-        logging.info("ARM validateMoveResources: running
+        logging.info("ARM validateMoveResources: running per RG (single batch per RG).")
+        all_rgs_names = list(grouped.keys())
+        def pick_target_rg(src_rg: str) -> str:
+            candidates = [r for r in all_rgs_names if r and r.lower()!=src_rg.lower()]
+            if not candidates: return ""
+            for pref in ("migr","target","transit","move"):
+                for r in candidates:
+                    if pref in r.lower(): return r
+            return candidates[0]
+        for rg, ids in grouped.items():
+            tgt = pick_target_rg(rg)
+            if not tgt:
+                logging.info(f"ARM validate: skipping RG '{rg}' (no alternate target RG found).")
+                continue
+            target_rg_id = f"/subscriptions/{sub_id}/resourceGroups/{tgt}"
+            res = validate_move_resources(sub_id, rg, ids, target_rg_id)
+            if isinstance(res, dict) and "error" in res:
+                arm_rg_errors[rg] = res["error"]
+                cat, why, _ = arm_error_to_tuple(res["error"])
+                arm_rg_msg[rg] = f"{cat}: {why}"
+                logging.info(f"ARM validate: RG '{rg}' → ERROR ({arm_rg_msg[rg]})")
+            else:
+                arm_rg_msg[rg] = "OK"
+                logging.info(f"ARM validate: RG '{rg}' → OK")
+
+    # פותחים את הקבצים
+    f_blockers = open(out_blockers,"w",newline="",encoding="utf-8")
+    w_blockers = csv.writer(f_blockers); w_blockers.writerow(headers_blockers)
+    f_allres = open(out_allres,"w",newline="",encoding="utf-8")
+    w_allres = csv.writer(f_allres); w_allres.writerow(headers_allres)
+
+    # ריצה ריסורס-ריסורס עם לוג התקדמות
+    total = len(flat)
+    start_loop = time.perf_counter()
+    for i, (rg, rid) in enumerate(flat, start=1):
+        # התקדמות
+        pct = (i/total)*100.0
+        logging.info(f"Progress: {i}/{total} resources processed ({pct:.1f}%) | RG: {rg}")
+
+        is_child, top_type, full_type, parent_id, parent_type = parse_types(rid)
+        table_bool, table_note, matched_type = table_status_for_type(full_type, top_type, support_map)
+
+        # מיפוי Yes/No/Not in table
+        if table_bool is True:
+            table_support = "Yes"
+        elif table_bool is False:
+            table_support = "No"
+        else:
+            table_support = "Not in table"  # בהתאם לבקשה
+
+        arm_msg = ""
+        if RUN_ARM_VALIDATE and rg in arm_rg_msg:
+            arm_msg = arm_rg_msg[rg]
+
+        # כתיבה ל-All resources
+        w_allres.writerow([
+            sub_id, rg, rid,
+            matched_type,
+            "Yes" if is_child else "No",
+            parent_id or "",
+            parent_type or "",
+            table_support,
+            table_note,
+            arm_msg
+        ])
+
+        # כתיבה ל-Blockers: רק No או Not in table
+        if table_support in ("No","Not in table"):
+            w_blockers.writerow([
+                sub_id, rg, rid,
+                matched_type,
+                "Yes" if is_child else "No",
+                parent_id or "",
+                parent_type or "",
+                ("UnsupportedResourceType" if table_support=="No" else "NotInSupportTable"),
+                ("Resource type doesn’t support subscription move." if table_support=="No" else "Resource type not listed in move-support table."),
+                "move-support",
+                table_note,
+                arm_msg
+            ])
+        # בנוסף—אם יש שגיאת ARM ורוצים לכלול כ-Blocker
+        if RUN_ARM_VALIDATE and INCLUDE_ARM_BLOCKERS and rg in arm_rg_errors:
+            cat, why, doc = arm_error_to_tuple(arm_rg_errors[rg])
+            w_blockers.writerow([
+                sub_id, rg, rid,
+                matched_type,
+                "Yes" if is_child else "No",
+                parent_id or "",
+                parent_type or "",
+                cat,
+                why,
+                doc,
+                table_note,
+                arm_msg or f"{cat}: {why}"
+            ])
+
+    f_blockers.close()
+    f_allres.close()
+
+    # סיכום
+    elapsed = time.perf_counter() - t0
+    loop_elapsed = time.perf_counter() - start_loop
+    logging.info(f"Summary: processed {total} resources across {rg_count} RGs in {elapsed:.1f}s (scan loop: {loop_elapsed:.1f}s)")
+    print("📄 Files created:")
+    print(f" - {out_discovery}")
+    print(f" - {out_reasons}")
+    print(f" - {out_blockers}")
+    print(f" - {out_allres}")
+    print(f"⏱️ Total duration: {elapsed:.1f}s")
+
+if __name__ == "__main__":
+    main()
