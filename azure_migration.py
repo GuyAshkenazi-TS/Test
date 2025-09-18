@@ -24,7 +24,7 @@ os.environ.setdefault("AZURE_EXTENSION_USE_DYNAMIC_INSTALL", "yes_without_prompt
 
 MOVE_SUPPORT_URL = os.getenv(
     "MOVE_SUPPORT_URL",
-    "https://raw.githubusercontent.com/GuyAshkenazi-TS/azure-env-assessment/refs/heads/main/move-support-resources-local.csv"
+    "https://raw.githubusercontent.com/GuyAshkenazi-TS/Test/refs/heads/main/move-support-resources-local.csv"
 )
 MISSING = "Not available"
 
