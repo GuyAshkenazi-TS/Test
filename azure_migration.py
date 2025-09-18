@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Azure Migration Assessor – single-file, read-only (final polish + progress logging)
+Azure Migration Assessor – single-file, read-only (with precise 'Why' from table)
 - Loads move-support table ONLY from your repo CSV (or env MOVE_SUPPORT_URL)
 - Emits three CSVs: discovery / non-transferable reasons / blockers
-- Verbose logging for progress, counts, and timing
+- Progress logging (counts of subs/RGs/resources)
 
 Table rules (Subscription column = source of truth):
 - Child must move with parent; supported children אינם חסם.
-- Child supported + parent NOT → ParentNotSupported
-- Child NOT + parent supported → UnsupportedChildTypeCannotMove
-- Neither supported → UnsupportedResourceType
+- Child supported + parent NOT → ParentNotSupported (כולל הערת ההורה אם קיימת)
+- Child NOT + parent supported → UnsupportedChildTypeCannotMove (כולל הערת הילד/הורה)
+- Neither supported → UnsupportedResourceType (כולל הערה)
 - Any validateMoveResources policy/permission/lock/provider errors = blockers
 """
 
@@ -30,11 +30,8 @@ MISSING = "Not available"
 
 # Known aliases / normalizations (rare typos / cosmetic variants that appear in some exports)
 TYPE_ALIASES = {
-    # example: "microsoft.network/networkmanager" : "microsoft.network/networkmanagers",
+    # "microsoft.network/networkmanager": "microsoft.network/networkmanagers",
 }
-
-# Progress printing granularity for large batches
-PROGRESS_EVERY_N_RESOURCES = 100
 
 # ---------------- Shell helpers ----------------
 def az(cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
@@ -71,13 +68,14 @@ def _pick_col(row, *candidates):
     return None
 
 # ---------------- Move-support (CSV from repo) ----------------
-def load_move_support_map_from_url(url: str) -> Dict[str, bool]:
+# support_map shape: { "microsoft.xxx/type[/child]" : {"ok": bool, "note": "<raw cell text>"} }
+def load_move_support_map_from_url(url: str) -> Dict[str, Dict[str, Any]]:
     with urllib.request.urlopen(url) as resp:
         raw = resp.read()
     text = raw.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
     rdr = csv.DictReader(io.StringIO(text))
 
-    support: Dict[str, bool] = {}
+    support: Dict[str, Dict[str, Any]] = {}
     for row in rdr:
         if not row:
             continue
@@ -90,19 +88,23 @@ def load_move_support_map_from_url(url: str) -> Dict[str, bool]:
 
         ns  = normalize_type(row.get(col_ns, ""))
         rt  = normalize_type(row.get(col_rt, ""))
-        sub = (row.get(col_sub, "") or "").strip().lower()
+        raw_sub = (row.get(col_sub, "") or "").strip()
+        sub_lc  = raw_sub.lower()
 
         if not ns or not rt:
             continue
 
         key = f"{ns}/{rt}"
-        support[key] = sub.startswith("yes")  # "Yes..." variants supported
+        support[key] = {
+            "ok": sub_lc.startswith("yes"),
+            "note": raw_sub,  # נשמור את הטקסט המקורי (כולל "Yes - Basic", "No - requires redeploy", וכו')
+        }
 
     if not support:
         raise RuntimeError("Support map is empty after parsing CSV.")
     return support
 
-def load_move_support_map() -> Dict[str, bool]:
+def load_move_support_map() -> Dict[str, Dict[str, Any]]:
     logging.info(f"Downloading move-support CSV from: {MOVE_SUPPORT_URL}")
     return load_move_support_map_from_url(MOVE_SUPPORT_URL)
 
@@ -237,16 +239,30 @@ def parse_types(resource_id: str):
         parent_id = re.sub(r"(/providers/[^/]+/[^/]+/[^/]+).*", r"\1", resource_id, flags=re.IGNORECASE)
     return is_child, top_type, full_type, parent_id, parent_type
 
-def classify_support(resource_id: str, support: Dict[str,bool]) -> Dict[str,Any]:
-    is_child, top_type, full_type, parent_id, parent_type = parse_types(resource_id)
-    top_ok  = support.get(top_type or "", None)
-    full_ok = support.get(full_type or "", None)
-    this_ok = full_ok if full_ok is not None else top_ok
+def _note_for_type(support: Dict[str, Dict[str, Any]], full_type: Optional[str], top_type: Optional[str]) -> str:
+    # prefer child-specific note; fallback to parent note
+    if full_type and full_type in support and isinstance(support[full_type], dict):
+        return support[full_type].get("note", "")
+    if top_type and top_type in support and isinstance(support[top_type], dict):
+        return support[top_type].get("note", "")
+    return ""
 
+def classify_support(resource_id: str, support: Dict[str,Dict[str,Any]]) -> Dict[str,Any]:
+    is_child, top_type, full_type, parent_id, parent_type = parse_types(resource_id)
+    top = support.get(top_type or "", None)
+    ful = support.get(full_type or "", None)
+
+    top_ok  = (top or {}).get("ok") if isinstance(top, dict) else None
+    full_ok = (ful or {}).get("ok") if isinstance(ful, dict) else None
+
+    this_ok = full_ok if full_ok is not None else top_ok
+    note    = _note_for_type(support, full_type, top_type)
+
+    # Not found in table → flag Unknown
     if this_ok is None:
         return {
             "BlockerCategory": "Unknown",
-            "Why": "Resource type not found in official move-support table (subscription column). Review manually.",
+            "Why": "Resource type not found in official move-support table (Subscription column). Review manually.",
             "DocRef": "move-support",
             "ResourceType": (full_type or top_type or ""),
             "IsChild": "Yes" if is_child else "No",
@@ -254,11 +270,14 @@ def classify_support(resource_id: str, support: Dict[str,bool]) -> Dict[str,Any]
             "ParentType": parent_type or "",
         }
 
+    # Supported
     if this_ok is True:
         if is_child and top_ok is False:
+            parent_note = support.get(top_type, {}).get("note", "")
+            why = f"Parent type not movable: {parent_note}" if parent_note else "Parent resource type doesn’t support subscription move."
             return {
                 "BlockerCategory": "ParentNotSupported",
-                "Why": "Parent resource type doesn’t support subscription move.",
+                "Why": why,
                 "DocRef": "move-support",
                 "ResourceType": full_type or top_type or "",
                 "IsChild": "Yes",
@@ -270,9 +289,10 @@ def classify_support(resource_id: str, support: Dict[str,bool]) -> Dict[str,Any]
     # Not supported
     if is_child:
         if top_ok is True:
+            why = f"Child type not movable: {note}" if note else "Child resource type doesn’t support subscription move although parent does."
             return {
                 "BlockerCategory":"UnsupportedChildTypeCannotMove",
-                "Why":"Child resource type doesn’t support subscription move although parent does.",
+                "Why": why,
                 "DocRef":"move-support",
                 "ResourceType": full_type or top_type or "",
                 "IsChild":"Yes",
@@ -280,9 +300,11 @@ def classify_support(resource_id: str, support: Dict[str,bool]) -> Dict[str,Any]
                 "ParentType": parent_type or "",
             }
         else:
+            parent_note = support.get(top_type, {}).get("note", "")
+            why = f"Neither parent nor child movable: child={note or 'No'}, parent={parent_note or 'No'}"
             return {
                 "BlockerCategory":"UnsupportedResourceType",
-                "Why":"Neither child nor parent supports subscription move.",
+                "Why": why,
                 "DocRef":"move-support",
                 "ResourceType": full_type or top_type or "",
                 "IsChild":"Yes",
@@ -290,9 +312,10 @@ def classify_support(resource_id: str, support: Dict[str,bool]) -> Dict[str,Any]
                 "ParentType": parent_type or "",
             }
     else:
+        why = f"Not movable: {note}" if note else "Resource type doesn’t support subscription move."
         return {
             "BlockerCategory":"UnsupportedResourceType",
-            "Why":"Resource type doesn’t support subscription move.",
+            "Why": why,
             "DocRef":"move-support",
             "ResourceType": top_type or "",
             "IsChild":"No",
@@ -312,7 +335,6 @@ def blocker_from_arm_error(err: Dict[str,Any]) -> Tuple[str,str,str]:
     except Exception:
         details = []
     detail_text = " | ".join([json.dumps(d, ensure_ascii=False) for d in details])
-
     blob = (json.dumps(err, ensure_ascii=False) + " " + detail_text).lower()
 
     if "requestdisallowedbypolicy" in blob or " policy" in blob:
@@ -337,8 +359,8 @@ def blocker_from_arm_error(err: Dict[str,Any]) -> Tuple[str,str,str]:
 
 # ---------------- Main ----------------
 def main():
-    start_t = time.time()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    start_ts = time.time()
     ensure_login()
 
     # Load support table (CSV from your repo)
@@ -350,9 +372,7 @@ def main():
     headers_blockers  = ["SubscriptionId","ResourceGroup","ResourceId","ResourceType","IsChild","ParentId","ParentType","BlockerCategory","Why","DocRef"]
 
     subs = az_json(["az","account","list","--all","-o","json"], [])
-    total_subs = len(subs or [])
-    logging.info(f"Discovered {total_subs} subscriptions.")
-
+    logging.info(f"Discovered {len(subs)} subscriptions in context.")
     billing_accounts = az_json(["az","billing","account","list","-o","json"], [])
     overall_agreement = ""
     try: overall_agreement = (billing_accounts[0].get("agreementType") or "")
@@ -367,12 +387,9 @@ def main():
     non_transferable_subs: List[str] = []
 
     # ---- Stage 1: discovery ----
-    for idx, s in enumerate(subs, start=1):
+    for s in subs:
         sub_id = s.get("id",""); state = s.get("state","")
-        logging.info(f"[{idx}/{total_subs}] Inspecting subscription {sub_id} (state={state})")
-        if not sub_id: 
-            logging.warning(f"Subscription at index {idx} has no ID; skipping.")
-            continue
+        if not sub_id: continue
 
         arm = az_json(["az","rest","--method","get","--url", f"https://management.azure.com/subscriptions/{sub_id}?api-version=2020-01-01","-o","json"], {})
         has_err=("error" in arm)
@@ -396,47 +413,46 @@ def main():
         w=csv.writer(f); w.writerow(headers_discovery); w.writerows(rows_discovery)
     with open(out_reasons,"w",newline="",encoding="utf-8") as f:
         w=csv.writer(f); w.writerow(headers_reasons); w.writerows(rows_reasons)
-    logging.info(f"✅ Discovery CSV: {out_discovery}  |  Reasons CSV: {out_reasons}")
-    logging.info(f"Marked {len(non_transferable_subs)} non-transferable subscriptions for blockers scan.")
+    logging.info(f"Discovery finished. Non-transferable subs: {len(non_transferable_subs)}")
+    print(f"✅ Discovery CSV: {out_discovery}")
+    print(f"✅ Reasons   CSV: {out_reasons}")
 
     # ---- Stage 2: blockers ----
     blockers_rows: List[List[str]] = []
-    total_resources_examined = 0
-    total_blockers_found = 0
-    total_rgs_examined = 0
+    total_resources_scanned = 0
+    total_blockers = 0
 
-    for sidx, sub_id in enumerate(non_transferable_subs, start=1):
-        sub_t0 = time.time()
+    for idx, sub_id in enumerate(non_transferable_subs, 1):
         all_rgs = list_rgs(sub_id)
-        if not all_rgs or len(all_rgs)==0:
-            logging.info(f"[{sidx}/{len(non_transferable_subs)}] {sub_id}: no resource groups → skipping blockers.")
+        logging.info(f"[{idx}/{len(non_transferable_subs)}] Subscription {sub_id}: {len(all_rgs)} resource groups.")
+        if not all_rgs:
+            logging.info(f"Skipping blockers for {sub_id}: no resource groups.")
             continue
 
         grouped = list_resources_by_rg(sub_id)
+        total_in_sub = sum(len(v) for v in grouped.values())
+        logging.info(f"Subscription {sub_id}: {len(grouped)} RGs with resources, {total_in_sub} resources to validate/classify.")
+
         if not grouped:
-            logging.info(f"[{sidx}/{len(non_transferable_subs)}] {sub_id}: no resources → skipping blockers.")
+            logging.info(f"Skipping blockers for {sub_id}: no resources.")
             continue
 
-        rg_names = list(grouped.keys())
-        logging.info(f"[{sidx}/{len(non_transferable_subs)}] {sub_id}: {len(rg_names)} RGs with resources to check.")
-        for ridx, src_rg in enumerate(rg_names, start=1):
-            ids = grouped.get(src_rg, []) or []
-            total_rgs_examined += 1
-            if not ids:
-                logging.info(f"  RG {ridx}/{len(rg_names)} '{src_rg}': 0 resources → skip.")
-                continue
+        processed_in_sub = 0
+        for rg_idx, (src_rg, ids) in enumerate(grouped.items(), 1):
+            processed_in_sub += len(ids)
+            total_resources_scanned += len(ids)
 
             tgt_rg = pick_intrasub_target_rg(sub_id, src_rg, all_rgs)
             if not tgt_rg:
-                logging.info(f"  RG {ridx}/{len(rg_names)} '{src_rg}': no alternate target RG → skip validation.")
+                logging.info(f"Skipping RG '{src_rg}' in {sub_id}: no alternate target RG exists.")
                 continue
             target_rg_id = f"/subscriptions/{sub_id}/resourceGroups/{tgt_rg}"
 
-            logging.info(f"  RG {ridx}/{len(rg_names)} '{src_rg}': validating {len(ids)} resources → target '{tgt_rg}'")
-            batch_t0 = time.time()
+            logging.info(f"  RG [{rg_idx}/{len(grouped)}] '{src_rg}': batch {len(ids)} resources → validateMoveResources → target '{tgt_rg}'")
+
             result = validate_move_resources(sub_id, src_rg, ids, target_rg_id)
 
-            # Global ARM error
+            # Case 1: Global ARM error → same category for all, but נכלול טיפוס מפוענח
             if isinstance(result, dict) and "error" in result:
                 cat, why, doc = blocker_from_arm_error(result["error"])
                 for rid in ids:
@@ -449,14 +465,13 @@ def main():
                         parent_t or "",
                         cat, why, doc
                     ])
-                total_resources_examined += len(ids)
-                total_blockers_found += len(ids)
-                logging.info(f"    ⛔ Global ARM error → marked {len(ids)} blockers (cat={cat}). Took {time.time()-batch_t0:.1f}s.")
+                    total_blockers += 1
+                logging.info(f"    ARM error → marked {len(ids)} blockers as '{cat}'. Progress {processed_in_sub}/{total_in_sub}.")
                 continue
 
-            # Table-driven per-resource
-            batch_blockers = 0
-            for i, rid in enumerate(ids, start=1):
+            # Case 2: No global error → classify by table per-resource
+            added = 0
+            for rid in ids:
                 cls = classify_support(rid, support_map)
                 if cls:
                     blockers_rows.append([
@@ -471,32 +486,20 @@ def main():
                         cls.get("Why",""),
                         cls.get("DocRef","move-support"),
                     ])
-                    batch_blockers += 1
-                total_resources_examined += 1
-                # Progress pulse for very large RGs
-                if i % PROGRESS_EVERY_N_RESOURCES == 0:
-                    logging.info(f"    Progress: {i}/{len(ids)} resources classified in RG '{src_rg}'...")
+                    total_blockers += 1
+                    added += 1
+            logging.info(f"    Classified {len(ids)} resources, blockers in RG '{src_rg}': {added}. Progress {processed_in_sub}/{total_in_sub}.")
 
-            total_blockers_found += batch_blockers
-            logging.info(f"    ✅ RG '{src_rg}': {len(ids)} resources classified, blockers found: {batch_blockers}. Took {time.time()-batch_t0:.1f}s.")
-
-        logging.info(f"Finished subscription {sub_id} in {time.time()-sub_t0:.1f}s.")
-
-    # Write blockers CSV
     if blockers_rows:
+        out_blockers = f"blockers_details_{ts}.csv"
         with open(out_blockers,"w",newline="",encoding="utf-8") as f:
             w=csv.writer(f); w.writerow(headers_blockers); w.writerows(blockers_rows)
-        logging.info(f"🔎 Blockers CSV: {out_blockers}")
+        print(f"🔎 Blockers CSV: {out_blockers}")
     else:
-        logging.info("🔎 Blockers scan: none detected (validateMoveResources + official move-support table).")
+        print("🔎 Blockers scan: none detected (validateMoveResources + official move-support table).")
 
-    # ---- Summary ----
-    elapsed = time.time() - start_t
-    logging.info("====================================================")
-    logging.info(f"SUMMARY: subs={total_subs}, non-transferable scanned={len(non_transferable_subs)}, "
-                 f"RGs scanned={total_rgs_examined}, resources examined={total_resources_examined}, "
-                 f"blockers found={total_blockers_found}, elapsed={elapsed:.1f}s")
-    logging.info("Outputs: %s | %s | %s", out_discovery, out_reasons, out_blockers if blockers_rows else "(no blockers csv)")
+    dur = time.time() - start_ts
+    logging.info(f"Done. Scanned resources: {total_resources_scanned}, blockers: {total_blockers}, elapsed: {int(dur)}s.")
 
 if __name__ == "__main__":
     main()
