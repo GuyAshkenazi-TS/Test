@@ -7,19 +7,19 @@ Outputs:
 Also prints ready-to-copy commands for Stage 2 per subscription.
 """
 
-import os, subprocess, json, csv, sys
+import os, subprocess, json, csv, sys, logging, time
 from datetime import datetime
 
 os.environ.setdefault("AZURE_CORE_NO_COLOR", "1")
 os.environ.setdefault("AZURE_EXTENSION_USE_DYNAMIC_INSTALL", "yes_without_prompt")
 
 # === CONFIG ===
-# קישור ה-RAW לטבלת ה-support (אותו אחד מהפרויקט שלך)
+
 MOVE_SUPPORT_URL = os.getenv(
     "MOVE_SUPPORT_URL",
     "https://raw.githubusercontent.com/GuyAshkenazi-TS/Test/refs/heads/main/move-support-resources-local.csv"
 )
-# קישור ה-RAW של שלב-2 (תעדכן אחרי שתעלה את הסקריפט השני)
+
 STAGE2_RAW = os.getenv(
     "STAGE2_RAW",
     "https://raw.githubusercontent.com/GuyAshkenazi-TS/Test/refs/heads/main/azure_assess_stage2.py"
@@ -100,12 +100,19 @@ def banner(text: str):
     print(f"\n{text}\n{line}")
 
 def main():
+    start = time.perf_counter()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.info("Stage-1: starting subscription discovery")
+
     ensure_login()
+
     subs = az_json(["az","account","list","--all","-o","json"], [])
     if not subs:
-        print("No subscriptions found (or insufficient permissions).")
-        sys.exit(0)
+        logging.warning("No subscriptions found (or insufficient permissions).")
+        print("No subscriptions found.")
+        return
 
+    logging.info(f"Found {len(subs)} subscriptions to process.")
     billing_accounts = az_json(["az","billing","account","list","-o","json"], [])
     overall_agreement = ""
     try:
@@ -118,10 +125,19 @@ def main():
     headers = ["Subscription ID","Sub. Type","Sub. Owner","Transferable (Internal)"]
     rows=[]
 
-    for s in subs:
+    total = len(subs)
+    for i, s in enumerate(subs, start=1):
         sub_id = s.get("id","")
-        if not sub_id: continue
-        arm = az_json(["az","rest","--method","get","--url", f"https://management.azure.com/subscriptions/{sub_id}?api-version=2020-01-01","-o","json"], {})
+        if not sub_id:
+            logging.warning(f"Skipping entry {i}/{total}: missing subscription id.")
+            continue
+
+        logging.info(f"[{i}/{total}] Processing subscription: {sub_id}")
+
+        arm = az_json(
+            ["az","rest","--method","get","--url", f"https://management.azure.com/subscriptions/{sub_id}?api-version=2020-01-01","-o","json"],
+            {}
+        )
         has_err=("error" in arm)
         quota_id = arm.get("subscriptionPolicies",{}).get("quotaId","") if not has_err else ""
         auth_src = arm.get("authorizationSource","") if not has_err else ""
@@ -131,13 +147,16 @@ def main():
         offer = offer_from_quota(quota_id, auth_src, has_mca)
         owner = resolve_owner(sub_id, offer)
         transferable = transferable_to_ea(offer)
+
         rows.append([sub_id, offer, owner, transferable])
 
     # Write CSV
     with open(out_discovery,"w",newline="",encoding="utf-8") as f:
         w=csv.writer(f); w.writerow(headers); w.writerows(rows)
 
-    # Output
+    elapsed = time.perf_counter() - start
+    logging.info(f"Discovery complete in {elapsed:.1f}s. CSV written to: {out_discovery}")
+
     print(f"✅ Subscriptions CSV: {out_discovery}")
 
     banner("Run Stage-2 per subscription (copy & paste)")
