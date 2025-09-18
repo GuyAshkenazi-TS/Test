@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Azure Migration Assessor – single-file, read-only (final with pre-scan + blockers includes 'Not in table')
+Azure Migration Assessor – single-file, read-only (final with pre-scan + blockers includes 'Not in table' + duration)
 - Loads move-support table ONLY from your repo CSV (or env MOVE_SUPPORT_URL)
 - No mutations – uses only GET/list operations (read-only)
 - Emits four CSVs:
@@ -9,15 +9,10 @@ Azure Migration Assessor – single-file, read-only (final with pre-scan + block
    2) non_transferable_reasons_<ts>.csv
    3) blockers_details_<ts>.csv            -> כל הריסורסים שהטבלה מסמנת No + כל מה ש'Not in table'
    4) resources_support_matrix_<ts>.csv    -> כל הריסורסים עם Yes/No/Not in table
-
-דגלים אופציונליים:
-- MOVE_SUPPORT_URL         (ברירת מחדל: ה-CSV מה-Repo שלך)
-- RUN_ARM_VALIDATE=1       (רק לצירוף הודעת ARM לעמודת עזר; לא חוסם)
-- INCLUDE_ARM_BLOCKERS=1   (אם באמת תרצה שגם ARM ייחשבו כחוסמים; ברירת מחדל כבוי)
 """
 
-import os, subprocess, json, csv, io, re, urllib.request, logging
-from datetime import datetime
+import os, subprocess, json, csv, io, re, urllib.request, logging, time
+from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple, Optional
 
 # ---------------- Config ----------------
@@ -273,6 +268,7 @@ def table_status_for_type(full_type: Optional[str], top_type: Optional[str], sup
 
 # ---------------- Main ----------------
 def main():
+    start_ts = time.perf_counter()  # ---- start timing ----
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     ensure_login()
 
@@ -351,7 +347,7 @@ def main():
             continue
         logging.info(f"[Pre-scan] {sub_id}: {rg_count} RGs, {res_count} resources.")
         for rg, ids in grouped.items():
-            if not ids: 
+            if not ids:
                 continue
             work.append((sub_id, rg, ids))
 
@@ -468,6 +464,12 @@ def main():
         with open(out_blockers,"w",newline="",encoding="utf-8") as f:
             w=csv.writer(f); w.writerow(headers_blockers)
 
+    # ---- duration ----
+    elapsed = time.perf_counter() - start_ts
+    td = timedelta(seconds=elapsed)
+    # מחרוזת זמן קריאה (כולל אלפיות)
+    hhmmss_msec = f"{str(td).split('.')[0]}.{int((elapsed % 1)*1000):03d}"
+
     # סיכום למסך
     print("")
     print("──────── Summary ────────")
@@ -476,6 +478,7 @@ def main():
     print(f"Total resources scanned : {total_to_scan}")
     print(f"Total blockers (table)  : {total_blockers}"
           f"{'  (+ ARM included)' if INCLUDE_ARM_BLOCKERS else ''}")
+    print(f"Total duration          : {hhmmss_msec}")
     print("")
     print(f"📄 Discovery CSV        : {out_discovery}")
     print(f"📄 Reasons CSV          : {out_reasons}")
