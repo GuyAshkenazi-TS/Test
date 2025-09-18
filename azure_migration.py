@@ -1,27 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Azure Migration Assessor – table-first, read-only (ALL resources coverage)
+Azure Migration Assessor – single-file, read-only (final)
+- Loads move-support table ONLY from your repo CSV (or env MOVE_SUPPORT_URL)
+- No mutations – uses only GET/list operations (read-only)
+- Emits four CSVs:
+   1) azure_env_discovery_<ts>.csv
+   2) non_transferable_reasons_<ts>.csv
+   3) blockers_details_<ts>.csv            -> רק No מהטבלה
+   4) resources_support_matrix_<ts>.csv    -> כל הריסורסים עם Yes/No/Not in table
 
-Outputs:
-1) azure_env_discovery_<ts>.csv
-2) non_transferable_reasons_<ts>.csv
-3) resources_move_support_<ts>.csv  ← כל הריסורסים בכל הסאבים: Yes / No / Not in table
-4) blockers_details_<ts>.csv        ← רק No מהטבלה (Not Movable)
-
-Notes:
-- מקורות האמת ל-Yes/No הם עמודת Subscription בטבלת ה-CSV שלך (MOVE_SUPPORT_URL).
-- Unknown הוחלף ל-"Not in table".
-- לוגינג מציג ספירה כוללת של ריסורסים + התקדמות.
-- אפשרות ARM validate לצרכי אינדיקציה (לא חובה): VALIDATE_ARM=1
-- שליטה בתדירות פרוגרס: PROGRESS_EVERY (ברירת מחדל 50)
+Table rules (Subscription column = source of truth):
+- Child moves with parent; supported children אינם חסם.
+- Child supported + parent NOT → ParentNotSupported (תאורטי; בפועל blockers מוציא רק No)
+- Child NOT + parent supported → UnsupportedChildTypeCannotMove (תאורטי; blockers מוציא רק No)
+- Neither supported → UnsupportedResourceType (תאורטי; blockers מוציא רק No)
+- ARM validation is optional & read-only. By default we DO NOT mark ARM issues as blockers.
+  Set INCLUDE_ARM_BLOCKERS=1 to include them as blockers.
 """
 
 import os, subprocess, json, csv, io, re, urllib.request, logging
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 
-# ---------- Config ----------
+# ---------------- Config ----------------
 os.environ.setdefault("AZURE_CORE_NO_COLOR", "1")
 os.environ.setdefault("AZURE_EXTENSION_USE_DYNAMIC_INSTALL", "yes_without_prompt")
 
@@ -29,17 +31,16 @@ MOVE_SUPPORT_URL = os.getenv(
     "MOVE_SUPPORT_URL",
     "https://raw.githubusercontent.com/GuyAshkenazi-TS/Test/refs/heads/main/move-support-resources-local.csv"
 )
-VALIDATE_ARM   = os.getenv("VALIDATE_ARM", "0") == "1"
-PROGRESS_EVERY = max(1, int(os.getenv("PROGRESS_EVERY", "50")))
-
+INCLUDE_ARM_BLOCKERS = os.getenv("INCLUDE_ARM_BLOCKERS", "0") == "1"   # ברירת מחדל לא
+RUN_ARM_VALIDATE     = os.getenv("RUN_ARM_VALIDATE", "0") == "1"       # אפשר להדליק אם רוצים לצרף הודעות ARM בעמודת עזר
 MISSING = "Not available"
 
+# ידיות לנירמול טייפים (אם תמצא שמות חלופיים בשטח)
 TYPE_ALIASES = {
-    # דוגמאות אם צריך לנרמל שמות טיפוסים חריגים:
     # "microsoft.network/networkmanager": "microsoft.network/networkmanagers",
 }
 
-# ---------- Shell helpers ----------
+# ---------------- Shell helpers ----------------
 def az(cmd: List[str], check: bool = True) -> Tuple[int, str, str]:
     p = subprocess.run(cmd, capture_output=True, text=True)
     if check and p.returncode != 0:
@@ -56,7 +57,7 @@ def az_json(cmd: List[str], default: Any):
 def ensure_login():
     az(["az", "account", "show", "--only-show-errors"], check=False)
 
-# ---------- String / type ----------
+# ---------------- String / type helpers ----------------
 def normalize_type(s: str) -> str:
     if not s: return ""
     t = s.strip().lower()
@@ -73,52 +74,56 @@ def _pick_col(row, *candidates):
         if k: return k
     return None
 
-# ---------- Move-support map ----------
-def load_move_support_map_from_url(url: str) -> Dict[str, Dict[str, Any]]:
+# ---------------- Move-support (CSV from repo) ----------------
+def load_move_support_map_from_url(url: str) -> Dict[str, Tuple[Optional[bool], str]]:
+    """
+    מחזיר map:
+      key = 'microsoft.xxx/type[/child]'
+      val = (is_supported: True/False/None, note: str)
+    """
     with urllib.request.urlopen(url) as resp:
         raw = resp.read()
     text = raw.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n")
     rdr = csv.DictReader(io.StringIO(text))
 
-    support: Dict[str, Dict[str, Any]] = {}
+    support: Dict[str, Tuple[Optional[bool], str]] = {}
     for row in rdr:
         if not row:
             continue
         col_ns   = _pick_col(row, "resourceProvider", "provider", "namespace", "rp")
         col_rt   = _pick_col(row, "resourceType", "type", "resourcetype")
         col_sub  = _pick_col(row, "subscription", "subscription_move", "subscription support")
-        col_note = _pick_col(row, "subscription_note", "note", "subscriptionreason", "reason")
+        col_note = _pick_col(row, "note", "notes", "comment", "why")
 
         if not (col_ns and col_rt and col_sub):
             continue
 
-        ns  = normalize_type(row.get(col_ns, ""))
-        rt  = normalize_type(row.get(col_rt, ""))
-        sub = (row.get(col_sub, "") or "").strip().lower()
-        note = (row.get(col_note, "") or "").strip() if col_note else ""
+        ns   = normalize_type(row.get(col_ns, ""))
+        rt   = normalize_type(row.get(col_rt, ""))
+        subs = (row.get(col_sub, "") or "").strip().lower()
+        note = (row.get(col_note, "") or "").strip()
 
         if not ns or not rt:
             continue
 
         key = f"{ns}/{rt}"
-        if sub.startswith("yes"):
-            ok: Optional[bool] = True
-        elif sub.startswith("no"):
-            ok = False
+        if subs.startswith("yes"):
+            support[key] = (True, note)
+        elif subs.startswith("no"):
+            support[key] = (False, note)
         else:
-            ok = None  # Not in table
-
-        support[key] = {"ok": ok, "note": note}
+            # רשומה קיימת אבל בלי Yes/No ברור – נתעד כ־None אבל עדיין נשמור את ההערה
+            support[key] = (None, note)
 
     if not support:
         raise RuntimeError("Support map is empty after parsing CSV.")
     return support
 
-def load_move_support_map() -> Dict[str, Dict[str, Any]]:
-    logging.info(f"Downloading move-support CSV: {MOVE_SUPPORT_URL}")
+def load_move_support_map() -> Dict[str, Tuple[Optional[bool], str]]:
+    logging.info(f"Downloading move-support CSV from: {MOVE_SUPPORT_URL}")
     return load_move_support_map_from_url(MOVE_SUPPORT_URL)
 
-# ---------- Offer / Owner / Transferability ----------
+# ---------------- Offer / Owner / Transferability ----------------
 def offer_from_quota(quota_id: str, authorization_source: str, has_mca_billing_link: bool) -> str:
     q = quota_id or ""
     if any(x in q for x in ("MSDN","MS-AZR-0029P","MS-AZR-0062P","MS-AZR-0063P","VisualStudio","VS")):
@@ -184,7 +189,7 @@ def reason_for_non_transferable(offer: str, state: str, auth_src: str) -> Tuple[
         return ("NotSupportedOffer","Dev/Test or classic/unknown offer isn’t supported for a direct EA transfer.","Transfer matrix")
     return ("Unknown","Insufficient data to determine blocking reason.","Check tenant/offer/permissions")
 
-# ---------- Inventory ----------
+# ---------------- Inventory ----------------
 def list_rgs(sub_id: str) -> List[str]:
     rgs = az_json(["az","group","list","--subscription",sub_id,"-o","json"], [])
     return [rg.get("name") for rg in rgs if rg.get("name")]
@@ -207,8 +212,42 @@ def list_resources_by_rg(subscription_id: str) -> Dict[str,List[str]]:
         if rg and rid: grouped.setdefault(rg, []).append(rid)
     return grouped
 
-# ---------- Parse types ----------
+# ---------------- ARM (optional, read-only) ----------------
+def validate_move_resources(source_sub: str, rg: str, resource_ids: List[str], target_rg_id: str) -> Dict[str,Any]:
+    body = json.dumps({"resources": resource_ids, "targetResourceGroup": target_rg_id})
+    code, out, err = az(["az","resource","invoke-action","--action","validateMoveResources",
+                         "--ids", f"/subscriptions/{source_sub}/resourceGroups/{rg}",
+                         "--request-body", body], check=False)
+    if code==0 and out:
+        try: return json.loads(out)
+        except Exception: return {}
+    return {"error":{"code":"ValidationFailed","message": err or "Validation failed"}}
+
+def _shorten(s: str, n: int = 240) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else (s[:n-1] + "…")
+
+def arm_error_to_tuple(err: Dict[str,Any]) -> Tuple[str,str,str]:
+    blob = json.dumps(err, ensure_ascii=False).lower()
+    if "requestdisallowedbypolicy" in blob or " policy" in blob:
+        return ("PolicyBlocked","Blocked by Azure Policy on source/target.","Align policy & re-validate")
+    if "lock" in blob or "readonly" in blob:
+        return ("ResourceLockPresent","Read-only lock on source/destination RG/subscription.","Remove lock before move")
+    if "not registered for a resource type" in blob or ("provider" in blob and "register" in blob):
+        return ("ProviderRegistrationMissing","Missing provider registration in target subscription.","Register provider in target subscription")
+    if "denyassignment" in blob or "insufficient" in blob or "not permitted" in blob or "authorization" in blob:
+        return ("InsufficientPermissions","Caller lacks required permissions.","Ensure moveResources on source + write on target")
+    if "cannot be moved" in blob or "not supported for move" in blob:
+        return ("UnsupportedResourceType","Type/SKU not supported for move.","move-support")
+    return ("ValidationFailed", _shorten(err.get("message") or err.get("code") or ""), "ARM validateMoveResources")
+
+# ---------------- Parse types & classification ----------------
 def parse_types(resource_id: str):
+    """
+    Returns: is_child, top_level_type, full_type, parent_id, parent_type
+    ex: .../providers/Microsoft.Web/sites/myapp/slots/stage
+        top = microsoft.web/sites, full = microsoft.web/sites/slots
+    """
     m = re.search(r"/providers/([^/]+)/([^/]+)(/.*)?", resource_id, re.IGNORECASE)
     if not m:
         return False, None, None, None, None
@@ -226,47 +265,39 @@ def parse_types(resource_id: str):
         parent_id = re.sub(r"(/providers/[^/]+/[^/]+/[^/]+).*", r"\1", resource_id, flags=re.IGNORECASE)
     return is_child, top_type, full_type, parent_id, parent_type
 
-# ---------- Table lookup ----------
-def table_status_for_type(full_type: str, top_type: str, support: Dict[str,Dict[str,Any]]) -> Tuple[Optional[bool], str, str]:
-    full = support.get(full_type or "", None)
-    top  = support.get(top_type or "", None)
-    if full is not None and isinstance(full, dict) and "ok" in full:
-        return full["ok"], full.get("note",""), full_type
-    if top  is not None and isinstance(top, dict) and "ok" in top:
-        return top["ok"], top.get("note",""), top_type
+def table_status_for_type(full_type: Optional[str], top_type: Optional[str], support: Dict[str, Tuple[Optional[bool], str]]):
+    """
+    מחזיר: (is_supported: True/False/None, note, key_hit)
+    """
+    if full_type and full_type in support:
+        return support[full_type][0], support[full_type][1], full_type
+    if top_type and top_type in support:
+        return support[top_type][0], support[top_type][1], top_type
     return None, "", (full_type or top_type or "")
 
-# ---------- Optional ARM validation (info only) ----------
-def validate_move_resources(source_sub: str, rg: str, resource_ids: List[str], target_rg_id: str) -> Dict[str,Any]:
-    body = json.dumps({"resources": resource_ids, "targetResourceGroup": target_rg_id})
-    code, out, err = az(["az","resource","invoke-action","--action","validateMoveResources",
-                         "--ids", f"/subscriptions/{source_sub}/resourceGroups/{rg}",
-                         "--request-body", body], check=False)
-    if code==0 and out:
-        try: return json.loads(out)
-        except Exception: return {"error":{"code":"ParseError","message":"Failed to parse ARM response"}}
-    return {"error":{"code":"ValidationFailed","message": err or "Validation failed"}}
-
-# ---------- Main ----------
+# ---------------- Main ----------------
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     ensure_login()
 
+    # Load support table (CSV from your repo)
     support_map = load_move_support_map()
     logging.info(f"Loaded {len(support_map)} resource-type rows into support map.")
 
+    # Output filenames
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_discovery   = f"azure_env_discovery_{ts}.csv"
-    out_reasons     = f"non_transferable_reasons_{ts}.csv"
-    out_resources   = f"resources_move_support_{ts}.csv"
-    out_blockers    = f"blockers_details_{ts}.csv"
+    out_discovery = f"azure_env_discovery_{ts}.csv"
+    out_reasons   = f"non_transferable_reasons_{ts}.csv"
+    out_blockers  = f"blockers_details_{ts}.csv"
+    out_allres    = f"resources_support_matrix_{ts}.csv"
 
+    # CSV headers
     headers_discovery = ["Subscription ID","Sub. Type","Sub. Owner","Transferable (Internal)"]
     headers_reasons   = ["Subscription ID","Sub. Type","ReasonCode","Why","DocRef"]
-    headers_resources = ["SubscriptionId","ResourceGroup","ResourceId","ResourceType","IsChild","ParentId","ParentType","TableSupport","TableNote","ArmError"]
-    headers_blockers  = ["SubscriptionId","ResourceGroup","ResourceId","ResourceType","IsChild","ParentId","ParentType","BlockerCategory","Why","DocRef","TableNote","ArmError"]
+    headers_blockers  = ["SubscriptionId","ResourceGroup","ResourceId","ResourceType","IsChild","ParentId","ParentType","BlockerCategory","Why","DocRef","TableNote","ArmMessage"]
+    headers_allres    = ["SubscriptionId","ResourceGroup","ResourceId","ResourceType","IsChild","ParentId","ParentType","TableSupport","TableNote","ArmMessage"]
 
-    # Stage 1: subscriptions discovery
+    # Stage 0: discovery of subscriptions
     subs = az_json(["az","account","list","--all","-o","json"], [])
     billing_accounts = az_json(["az","billing","account","list","-o","json"], [])
     overall_agreement = ""
@@ -274,6 +305,9 @@ def main():
     except Exception: pass
 
     rows_discovery=[]; rows_reasons=[]
+    # בגרסה זו נריץ מיפוי ריסורסים על כל הסבסקריפשנים, לא רק ה"לא־מעבירי־בילינג"
+    target_subs: List[str] = []
+
     for s in subs:
         sub_id = s.get("id",""); state = s.get("state","")
         if not sub_id: continue
@@ -290,11 +324,13 @@ def main():
         transferable = transferable_to_ea(offer)
 
         rows_discovery.append([sub_id, offer, owner, transferable])
+        target_subs.append(sub_id)
 
         if transferable == "No":
             code, why, doc = reason_for_non_transferable(offer, state, auth_src)
             rows_reasons.append([sub_id, offer, code, why, doc])
 
+    # write discovery/reasons
     with open(out_discovery,"w",newline="",encoding="utf-8") as f:
         w=csv.writer(f); w.writerow(headers_discovery); w.writerows(rows_discovery)
     with open(out_reasons,"w",newline="",encoding="utf-8") as f:
@@ -302,103 +338,140 @@ def main():
     print(f"✅ Discovery CSV: {out_discovery}")
     print(f"✅ Reasons   CSV: {out_reasons}")
 
-    # Stage 2: ALL subscriptions → ALL resources (for resources_move_support),
-    #          blockers_details יוציא רק No לפי הטבלה
-    # Pre-count for progress
+    # Stage 1: enumerate ALL resources (to know total work)
+    work: List[Tuple[str,str,List[str]]] = []  # (sub, rg, [ids])
     total_to_scan = 0
-    pre_grouped: Dict[str, Dict[str, List[str]]] = {}
-    for s in subs:
-        sub_id = s.get("id","")
-        if not sub_id: continue
-        grouped = list_resources_by_rg(sub_id)
-        pre_grouped[sub_id] = grouped
-        subtotal = sum(len(v) for v in grouped.values())
-        total_to_scan += subtotal
-        logging.info(f"Pre-scan: subscription {sub_id} has {subtotal} resources across {len(grouped)} RGs.")
-
-    if total_to_scan == 0:
-        logging.info("No resources found in any subscription.")
-    else:
-        logging.info(f"Total resources to scan: {total_to_scan}")
-
-    rows_resources=[]; rows_blockers=[]
-    scanned = 0
-    total_blockers=0
-
-    for sub_id, grouped in pre_grouped.items():
-        if not grouped:
+    for sub_id in target_subs:
+        rgs = list_rgs(sub_id)
+        if not rgs:
+            logging.info(f"Skipping {sub_id}: no resource groups.")
             continue
+        grouped = list_resources_by_rg(sub_id)
+        if not grouped:
+            logging.info(f"Skipping {sub_id}: no resources.")
+            continue
+        for rg, ids in grouped.items():
+            if not ids: continue
+            work.append((sub_id, rg, ids))
+            total_to_scan += len(ids)
 
-        # Optional ARM hint per-RG (purely informational)
-        rg_arm_err: Dict[str, str] = {}
-        if VALIDATE_ARM:
-            rgs = list(grouped.keys())
-            for src_rg, ids in grouped.items():
-                tgt = next((r for r in rgs if r.lower()!=src_rg.lower()), "")
-                if tgt:
-                    target_rg_id = f"/subscriptions/{sub_id}/resourceGroups/{tgt}"
-                    res = validate_move_resources(sub_id, src_rg, ids, target_rg_id)
-                    if "error" in (res or {}):
-                        arm_blob = (res.get("error", {}).get("message") or json.dumps(res.get("error", {}), ensure_ascii=False))
-                        rg_arm_err[src_rg] = arm_blob
-                        logging.info(f"[ARM hint] {sub_id}/{src_rg}: {arm_blob[:120]}")
+    logging.info(f"Total resources to scan: {total_to_scan}")
 
-        for src_rg, ids in grouped.items():
-            arm_blob = rg_arm_err.get(src_rg, "") if VALIDATE_ARM else ""
-            for rid in ids:
-                is_child, top_t, full_t, parent_id, parent_t = parse_types(rid)
-                t_ok, t_note, _tkey = table_status_for_type(full_t, top_t, support_map)
-                table_support = ("Yes" if t_ok else ("No" if t_ok is False else "Not in table"))
+    # Stage 2: process resources (per resource logging)
+    rows_blockers: List[List[str]] = []
+    rows_all: List[List[str]] = []
 
-                rows_resources.append([
+    scanned = 0
+    total_blockers = 0
+
+    # אופציונלי: להריץ validate לכל RG (קריאה אחת לכל קבוצה) – ברירת מחדל כבוי
+    arm_rg_errors: Dict[Tuple[str,str], Tuple[str,str,str]] = {}  # (sub,rg) -> (Cat,Why,DocRef or message)
+    arm_rg_msg:    Dict[Tuple[str,str], str] = {}
+
+    if RUN_ARM_VALIDATE:
+        logging.info("ARM validateMoveResources is ENABLED (RUN_ARM_VALIDATE=1). Collecting RG-level errors…")
+        for (sub_id, rg, ids) in work:
+            # נבחר RG יעד זמני בתוך אותה סאב (כל RG אחר)
+            all_rgs = [x for x,_,_ in work if x == sub_id]
+            target_rg_name = None
+            # לא מחפשים באמת כאן; העיקר לקבל שגיאה כללית אם קיימת
+            target_rg_name = rg
+            target_rg_id = f"/subscriptions/{sub_id}/resourceGroups/{target_rg_name}"
+            result = validate_move_resources(sub_id, rg, ids, target_rg_id)
+            if isinstance(result, dict) and "error" in result:
+                cat, why, doc = arm_error_to_tuple(result["error"])
+                arm_rg_errors[(sub_id,rg)] = (cat, why, doc)
+                arm_rg_msg[(sub_id,rg)] = _shorten(json.dumps(result["error"], ensure_ascii=False))
+            else:
+                arm_rg_msg[(sub_id,rg)] = ""
+        logging.info("Finished ARM validation pre-pass.")
+
+    for (sub_id, src_rg, ids) in work:
+        arm_cat, arm_why, arm_doc = arm_rg_errors.get((sub_id,src_rg), ("","",""))
+        arm_blob = arm_rg_msg.get((sub_id,src_rg), "")
+        for rid in ids:
+            is_child, top_t, full_t, parent_id, parent_t = parse_types(rid)
+            t_ok, t_note, _tkey = table_status_for_type(full_t, top_t, support_map)
+
+            # Map to printable support
+            if t_ok is True:
+                table_support = "Yes"
+            elif t_ok is False:
+                table_support = "No"
+            else:
+                table_support = "Not in table"
+
+            # ----- לוגינג פר ריסורס -----
+            scanned += 1
+            pct = (scanned / total_to_scan * 100.0) if total_to_scan else 100.0
+            logging.info(f"Resource {scanned}/{total_to_scan} ({pct:.1f}%): {rid}")
+
+            # All resources row
+            rows_all.append([
+                sub_id, src_rg, rid,
+                (full_t or top_t or ""),
+                "Yes" if is_child else "No",
+                parent_id or "",
+                parent_t or "",
+                table_support,
+                t_note,
+                arm_blob
+            ])
+
+            # Blockers: רק אלה שהטבלה אומרת No (גם אם יש ARM – לא יכנס אלא אם הדגל דולק)
+            if t_ok is False:
+                rows_blockers.append([
                     sub_id, src_rg, rid,
                     (full_t or top_t or ""),
                     "Yes" if is_child else "No",
                     parent_id or "",
                     parent_t or "",
-                    table_support,
+                    "UnsupportedResourceType",
+                    ("Not movable (table)" + (f": {t_note}" if t_note else "")),
+                    "move-support",
                     t_note,
                     arm_blob
                 ])
+                total_blockers += 1
+            elif INCLUDE_ARM_BLOCKERS and arm_cat:
+                # אם ביקשת במפורש לכלול ARM כחסם
+                rows_blockers.append([
+                    sub_id, src_rg, rid,
+                    (full_t or top_t or ""),
+                    "Yes" if is_child else "No",
+                    parent_id or "",
+                    parent_t or "",
+                    arm_cat,
+                    arm_why,
+                    arm_doc or "ARM",
+                    t_note,
+                    arm_blob
+                ])
+                total_blockers += 1
 
-                if t_ok is False:
-                    rows_blockers.append([
-                        sub_id, src_rg, rid,
-                        (full_t or top_t or ""),
-                        "Yes" if is_child else "No",
-                        parent_id or "",
-                        parent_t or "",
-                        "UnsupportedResourceType",
-                        ("Not movable (table)" + (f": {t_note}" if t_note else "")),
-                        "move-support",
-                        t_note,
-                        arm_blob
-                    ])
-                    total_blockers += 1
-
-                scanned += 1
-                if scanned % PROGRESS_EVERY == 0 or scanned == total_to_scan:
-                    pct = (scanned / total_to_scan * 100.0) if total_to_scan else 100.0
-                    logging.info(f"Progress: {scanned}/{total_to_scan} resources processed ({pct:.1f}%).")
-
-    with open(out_resources,"w",newline="",encoding="utf-8") as f:
-        w=csv.writer(f); w.writerow(headers_resources); w.writerows(rows_resources)
+    # כתיבת הקבצים
     if rows_blockers:
         with open(out_blockers,"w",newline="",encoding="utf-8") as f:
             w=csv.writer(f); w.writerow(headers_blockers); w.writerows(rows_blockers)
-        print(f"🔎 Blockers CSV (table-only): {out_blockers}")
     else:
-        print("🔎 Blockers: none by table (no 'No' rows).")
+        # גם אם אין בלוקרים – נייצר קובץ ריק עם כותרת לנוחות
+        with open(out_blockers,"w",newline="",encoding="utf-8") as f:
+            w=csv.writer(f); w.writerow(headers_blockers)
 
-    logging.info(f"Resources scanned: {scanned}, blockers (No): {total_blockers}")
+    with open(out_allres,"w",newline="",encoding="utf-8") as f:
+        w=csv.writer(f); w.writerow(headers_allres); w.writerows(rows_all)
 
-    print("\n===== OUTPUT FILES =====")
-    print(out_discovery)
-    print(out_reasons)
-    print(out_resources)
-    if rows_blockers:
-        print(out_blockers)
-    print("========================\n")
+    # סיכום במסך
+    print("")
+    print("──────── Summary ────────")
+    print(f"Total resources scanned : {total_to_scan}")
+    print(f"Total blockers (table)  : {total_blockers}{'  (+ ARM included)' if INCLUDE_ARM_BLOCKERS else ''}")
+    print("")
+    print(f"📄 Discovery CSV        : {out_discovery}")
+    print(f"📄 Reasons CSV          : {out_reasons}")
+    print(f"📄 Blockers CSV         : {out_blockers}")
+    print(f"📄 All-resources CSV    : {out_allres}")
+    print("─────────────────────────")
 
 if __name__ == "__main__":
     main()
