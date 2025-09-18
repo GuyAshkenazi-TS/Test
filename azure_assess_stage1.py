@@ -17,12 +17,12 @@ os.environ.setdefault("AZURE_EXTENSION_USE_DYNAMIC_INSTALL", "yes_without_prompt
 # קישור ה-RAW לטבלת ה-support (אותו אחד מהפרויקט שלך)
 MOVE_SUPPORT_URL = os.getenv(
     "MOVE_SUPPORT_URL",
-    "https://raw.githubusercontent.com/GuyAshkenazi-TS/azure-env-assessment/refs/heads/main/move-support-resources-local.csv"
+    "https://raw.githubusercontent.com/GuyAshkenazi-TS/Test/refs/heads/main/move-support-resources-local.csv"
 )
 # קישור ה-RAW של שלב-2 (תעדכן אחרי שתעלה את הסקריפט השני)
 STAGE2_RAW = os.getenv(
     "STAGE2_RAW",
-    "https://raw.githubusercontent.com/GuyAshkenazi-TS/azure-env-assessment/refs/heads/main/azure_assess_stage2.py"
+    "https://raw.githubusercontent.com/GuyAshkenazi-TS/Test/refs/heads/main/azure_assess_stage2.py"
 )
 
 MISSING = "Not available"
