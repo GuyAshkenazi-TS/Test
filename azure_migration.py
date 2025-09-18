@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Azure Migration Assessor – table-first, read-only
+Azure Migration Assessor – table-first, read-only (progress + nicer outputs)
 
 מה עושה:
 1) קורא את טבלת ה-Move Support מ-CSV (ברירת מחדל: ה-raw Git שלך או ע"י MOVE_SUPPORT_URL).
 2) מוציא:
    - azure_env_discovery_<ts>.csv
    - non_transferable_reasons_<ts>.csv
-   - resources_move_support_<ts>.csv  ← כל הריסורסים + Yes/No/Unknown לפי הטבלה
+   - resources_move_support_<ts>.csv  ← כל הריסורסים + Yes/No/Not in table לפי הטבלה
    - blockers_details_<ts>.csv        ← רק No מהטבלה (Not Movable)
 
-כללים:
-- ההכרעה אם Movable/Not Movable היא אך ורק לפי עמודת Subscription בטבלה.
-- אם יש עמודת הערה (subscription_note / note) – נכניס ל-TableNote.
-- ברירת מחדל לא מריצים validateMoveResources. אפשר להדליק עם VALIDATE_ARM=1 (לא משנה את בחירת ה-Blockers; רק מוסיף ArmError למידע).
+עדכונים לפי הבקשה:
+- Unknown הוחלף ל-"Not in table".
+- לוגינג עם התקדמות: כמה ריסורסים יש, מס' ריסורס נוכחי, ואחוזי התקדמות.
+- בסיום: הדפסה של שמות הקבצים שיצאו.
 
-סביבה:
-- MOVE_SUPPORT_URL     -> לינק ל-CSV שלך (ברירת מחדל: הרפו שלך)
-- VALIDATE_ARM=1/0     -> להפעיל גם ARM validation (לוג בלבד + עמודת ArmError; ה-Blockers עדיין לפי הטבלה)
+דגלים:
+- MOVE_SUPPORT_URL   -> לינק ל-CSV שלך (ברירת מחדל: הרפו שלך)
+- VALIDATE_ARM=1/0   -> להפעיל גם ARM validation (מידע בלבד; לא משנה הבחירה אם חסם)
+- PROGRESS_EVERY     -> כל כמה ריסורסים להדפיס התקדמות (ברירת מחדל: 50)
 """
 
-import os, subprocess, json, csv, io, re, urllib.request, logging
+import os, subprocess, json, csv, io, re, urllib.request, logging, math
 from datetime import datetime
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -33,7 +34,8 @@ MOVE_SUPPORT_URL = os.getenv(
     "MOVE_SUPPORT_URL",
     "https://raw.githubusercontent.com/GuyAshkenazi-TS/Test/refs/heads/main/move-support-resources-local.csv"
 )
-VALIDATE_ARM = os.getenv("VALIDATE_ARM", "0") == "1"
+VALIDATE_ARM   = os.getenv("VALIDATE_ARM", "0") == "1"
+PROGRESS_EVERY = max(1, int(os.getenv("PROGRESS_EVERY", "50")))  # כמה ריסורסים בין הודעות פרוגרס
 
 MISSING = "Not available"
 
@@ -105,13 +107,12 @@ def load_move_support_map_from_url(url: str) -> Dict[str, Dict[str, Any]]:
             continue
 
         key = f"{ns}/{rt}"
-        ok: Optional[bool]
         if sub.startswith("yes"):
-            ok = True
+            ok: Optional[bool] = True
         elif sub.startswith("no"):
             ok = False
         else:
-            ok = None
+            ok = None  # Not in table / לא מפורש
 
         support[key] = {"ok": ok, "note": note}
 
@@ -241,7 +242,7 @@ def table_status_for_type(full_type: str, top_type: str, support: Dict[str,Dict[
         return top["ok"], top.get("note",""), top_type
     return None, "", (full_type or top_type or "")
 
-# ---------------- Optional ARM validation (לוגיסטיקה בלבד) ----------------
+# ---------------- Optional ARM validation (מידע בלבד) ----------------
 def validate_move_resources(source_sub: str, rg: str, resource_ids: List[str], target_rg_id: str) -> Dict[str,Any]:
     body = json.dumps({"resources": resource_ids, "targetResourceGroup": target_rg_id})
     code, out, err = az(["az","resource","invoke-action","--action","validateMoveResources",
@@ -312,36 +313,52 @@ def main():
     print(f"✅ Discovery CSV: {out_discovery}")
     print(f"✅ Reasons   CSV: {out_reasons}")
 
-    # שלב 2: רמת ריסורס (תמיד נריץ על כל הסאבים שמופיעים כ-Non-transferable בשלב 1)
-    rows_resources=[]; rows_blockers=[]
-    total_resources=0; total_blockers=0
-
+    # שלב 2: רמת ריסורס רק לסאבים לא-ניידים (לפי שלב 1)
+    # – נחשב מראש כמה ריסורסים נסרוק לצורך לוגינג/פרוגרס
+    total_to_scan = 0
+    pre_grouped: Dict[str, Dict[str, List[str]]] = {}
     for sub_id in non_transferable_subs:
-        rgs = list_rgs(sub_id)
-        if not rgs:
-            logging.info(f"Skipping {sub_id}: no resource groups.")
-            continue
-
         grouped = list_resources_by_rg(sub_id)
+        pre_grouped[sub_id] = grouped
+        subtotal = sum(len(v) for v in grouped.values())
+        total_to_scan += subtotal
+        logging.info(f"Pre-scan: subscription {sub_id} has {subtotal} resources across {len(grouped)} RGs.")
+
+    if total_to_scan == 0:
+        logging.info("No resources to scan for blockers (table).")
+    else:
+        logging.info(f"Total resources to scan: {total_to_scan}")
+
+    rows_resources=[]; rows_blockers=[]
+    scanned = 0
+    total_blockers=0
+
+    for sub_id, grouped in pre_grouped.items():
         if not grouped:
             logging.info(f"Skipping {sub_id}: no resources.")
             continue
 
-        for src_rg, ids in grouped.items():
-            # ARM validate (אופציונלי בלבד; לא משפיע על הבחירה אם חסם או לא)
-            arm_blob = ""
-            if VALIDATE_ARM:
+        # אם VALIDATE_ARM, נכין מפת RG->ARMError (לוג בלבד)
+        rg_arm_err: Dict[str, str] = {}
+        if VALIDATE_ARM:
+            rgs = list(grouped.keys())
+            for src_rg, ids in grouped.items():
                 tgt = next((r for r in rgs if r.lower()!=src_rg.lower()), "")
                 if tgt:
                     target_rg_id = f"/subscriptions/{sub_id}/resourceGroups/{tgt}"
                     res = validate_move_resources(sub_id, src_rg, ids, target_rg_id)
                     if "error" in (res or {}):
                         arm_blob = (res.get("error", {}).get("message") or json.dumps(res.get("error", {}), ensure_ascii=False))
-                        logging.info(f"ARM validate hint for RG '{src_rg}': {arm_blob[:120]}")
+                        rg_arm_err[src_rg] = arm_blob
+                        logging.info(f"[ARM hint] {sub_id}/{src_rg}: {arm_blob[:120]}")
 
+        for src_rg, ids in grouped.items():
+            arm_blob = rg_arm_err.get(src_rg, "") if VALIDATE_ARM else ""
             for rid in ids:
                 is_child, top_t, full_t, parent_id, parent_t = parse_types(rid)
-                t_ok, t_note, t_key = table_status_for_type(full_t, top_t, support_map)
+                t_ok, t_note, _tkey = table_status_for_type(full_t, top_t, support_map)
+
+                table_support = ("Yes" if t_ok else ("No" if t_ok is False else "Not in table"))
 
                 rows_resources.append([
                     sub_id, src_rg, rid,
@@ -349,11 +366,10 @@ def main():
                     "Yes" if is_child else "No",
                     parent_id or "",
                     parent_t or "",
-                    ("Yes" if t_ok else ("No" if t_ok is False else "Unknown")),
+                    table_support,
                     t_note,
                     arm_blob
                 ])
-                total_resources += 1
 
                 # *** BLOCKERS: רק מה שהטבלה אומרת No ***
                 if t_ok is False:
@@ -371,6 +387,11 @@ def main():
                     ])
                     total_blockers += 1
 
+                scanned += 1
+                if scanned % PROGRESS_EVERY == 0 or scanned == total_to_scan:
+                    pct = (scanned / total_to_scan * 100.0) if total_to_scan else 100.0
+                    logging.info(f"Progress: {scanned}/{total_to_scan} resources processed ({pct:.1f}%).")
+
     # כתיבה לקבצים
     with open(out_resources,"w",newline="",encoding="utf-8") as f:
         w=csv.writer(f); w.writerow(headers_resources); w.writerows(rows_resources)
@@ -381,7 +402,16 @@ def main():
     else:
         print("🔎 Blockers: none by table (no 'No' rows).")
 
-    logging.info(f"Resources scanned: {total_resources}, blockers (No): {total_blockers}")
+    logging.info(f"Resources scanned: {scanned}, blockers (No): {total_blockers}")
+
+    # תמצית שמות הקבצים שיצאו
+    print("\n===== OUTPUT FILES =====")
+    print(out_discovery)
+    print(out_reasons)
+    print(out_resources)
+    if rows_blockers:
+        print(out_blockers)
+    print("========================\n")
 
 if __name__ == "__main__":
     main()
